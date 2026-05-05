@@ -1,0 +1,15 @@
+# Compiled binary
+/gho
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test data
+*.gho
+*.ghs

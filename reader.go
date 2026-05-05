@@ -1,0 +1,329 @@
+package gho
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"os"
+)
+
+// Image represents a parsed GHO image file.
+type Image struct {
+	Header     *FileHeader
+	Track0     []byte             // Raw Track 0 data (MBR at offset 6)
+	Track0Hdr  Track0Header       // 6-byte mini-header
+	Partitions []PartitionInfo    // Partition descriptors
+	EndRecord  *Record
+	file       *os.File
+}
+
+// PartitionInfo holds information about a single partition in the image.
+type PartitionInfo struct {
+	Descriptor *Record          // Type 0x0603 record
+	Header     *PartitionHeader // FEEF partition header
+	Spans      []Span           // Data spans (may span multiple continuation records)
+	DescBody   [20]byte         // Raw descriptor body
+}
+
+// Open opens and parses a GHO image file.
+func Open(path string) (*Image, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+
+	img := &Image{file: f}
+	if err := img.parse(); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return img, nil
+}
+
+// Close closes the underlying file.
+func (img *Image) Close() error {
+	if img.file != nil {
+		return img.file.Close()
+	}
+	return nil
+}
+
+func (img *Image) parse() error {
+	// Read file header
+	hdrBuf := make([]byte, HeaderSize)
+	if _, err := io.ReadFull(img.file, hdrBuf); err != nil {
+		return fmt.Errorf("gho: reading file header: %w", err)
+	}
+	var err error
+	img.Header, err = ParseFileHeader(hdrBuf)
+	if err != nil {
+		return err
+	}
+
+	// Scan records by finding record magic
+	offset := int64(HeaderSize)
+	for {
+		// Find next record by scanning for magic
+		recOff, err := img.findNextRecord(offset)
+		if err != nil {
+			return err
+		}
+		if recOff >= img.fileSize() {
+			break
+		}
+		offset = recOff
+
+		recBuf := make([]byte, RecordHeaderSize)
+		if _, err := img.file.ReadAt(recBuf, offset); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("gho: reading record at %#x: %w", offset, err)
+		}
+
+		rec, err := ParseRecord(recBuf, offset)
+		if err != nil {
+			return fmt.Errorf("gho: parsing record at %#x: %w", offset, err)
+		}
+
+		switch rec.TypeCode() {
+		case RecordTypeTrack0:
+			// Read Track 0 data (6-byte header + MBR + remaining sectors)
+			body := make([]byte, rec.BodyLen)
+			if _, err := img.file.ReadAt(body, offset+RecordHeaderSize); err != nil {
+				return fmt.Errorf("gho: reading Track0 body: %w", err)
+			}
+			if len(body) >= 6 {
+				img.Track0Hdr = Track0Header{
+					Unknown1: body[0],
+					Sectors:  body[1],
+					Unknown2: binary.LittleEndian.Uint32(body[2:6]),
+				}
+				img.Track0 = body[6:]
+			}
+			offset += RecordHeaderSize + int64(rec.BodyLen)
+
+		case RecordTypePartition:
+			// Read partition descriptor
+			pInfo := PartitionInfo{Descriptor: rec}
+			body := make([]byte, rec.BodyLen)
+			if _, err := img.file.ReadAt(body, offset+RecordHeaderSize); err != nil {
+				return fmt.Errorf("gho: reading partition descriptor: %w", err)
+			}
+			copy(pInfo.DescBody[:], body)
+			offset += RecordHeaderSize + int64(rec.BodyLen)
+
+			// Read FEEF partition header
+			feefBuf := make([]byte, HeaderSize)
+			if _, err := img.file.ReadAt(feefBuf, offset); err != nil {
+				return fmt.Errorf("gho: reading FEEF header: %w", err)
+			}
+			pInfo.Header, err = ParsePartitionHeader(feefBuf)
+			if err != nil {
+				return fmt.Errorf("gho: parsing FEEF header at %#x: %w", offset, err)
+			}
+			offset += HeaderSize
+			dataStart := offset
+
+			// Scan forward to find the next record
+			nextRecOff, err := img.findNextRecord(offset)
+			if err != nil {
+				return err
+			}
+			pInfo.Spans = append(pInfo.Spans, Span{DataStart: dataStart, DataEnd: nextRecOff})
+			offset = nextRecOff
+			img.Partitions = append(img.Partitions, pInfo)
+
+		case RecordTypeContinuation:
+			// Add span to last partition
+			body := make([]byte, rec.BodyLen)
+			if _, err := img.file.ReadAt(body, offset+RecordHeaderSize); err != nil {
+				return fmt.Errorf("gho: reading continuation body: %w", err)
+			}
+			offset += RecordHeaderSize + int64(rec.BodyLen)
+
+			// Check for optional FEEF header
+			checkBuf := make([]byte, 4)
+			if _, err := img.file.ReadAt(checkBuf, offset); err == nil {
+				if binary.LittleEndian.Uint16(checkBuf[0:2]) == FileMagic {
+					offset += HeaderSize // Skip FEEF header
+				}
+			}
+			dataStart := offset
+
+			// Find next record
+			nextRecOff, err := img.findNextRecord(offset)
+			if err != nil {
+				return err
+			}
+
+			if len(img.Partitions) > 0 {
+				last := &img.Partitions[len(img.Partitions)-1]
+				last.Spans = append(last.Spans, Span{DataStart: dataStart, DataEnd: nextRecOff})
+			}
+			offset = nextRecOff
+
+		case RecordTypeEnd:
+			img.EndRecord = rec
+			return nil // Done
+
+		default:
+			// Skip unknown records
+			offset += RecordHeaderSize + int64(rec.BodyLen)
+		}
+	}
+	return nil
+}
+
+func (img *Image) fileSize() int64 {
+	fi, err := img.file.Stat()
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
+}
+
+// findNextRecord scans forward from offset to find the next record header.
+// Records are identified by the magic value 0x012F18D8 at offset 4.
+func (img *Image) findNextRecord(startOff int64) (int64, error) {
+	// Read chunks and scan for record magic
+	const chunkSize = 65536
+	buf := make([]byte, chunkSize+10) // Extra bytes for cross-boundary matching
+
+	fi, err := img.file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	fileSize := fi.Size()
+
+	for off := startOff; off < fileSize; {
+		readLen := int64(chunkSize)
+		if off+readLen > fileSize {
+			readLen = fileSize - off
+		}
+		n, err := img.file.ReadAt(buf[:readLen], off)
+		if err != nil && err != io.EOF {
+			return 0, err
+		}
+		if n < RecordHeaderSize {
+			break
+		}
+
+		// Scan for record magic at aligned positions
+		// Records can appear at any byte offset
+		for i := 0; i <= n-RecordHeaderSize; i++ {
+			magic := binary.LittleEndian.Uint32(buf[i+4 : i+8])
+			if magic == RecordMagic {
+				return off + int64(i), nil
+			}
+		}
+		off += int64(n - 10) // Overlap to catch cross-boundary matches
+	}
+
+	return fileSize, nil // End of file
+}
+
+// DecompressPartition decompresses all blocks of a partition and writes to w.
+func (img *Image) DecompressPartition(partIdx int, w io.Writer) error {
+	if partIdx >= len(img.Partitions) {
+		return fmt.Errorf("gho: partition index %d out of range", partIdx)
+	}
+
+	pInfo := &img.Partitions[partIdx]
+	dst := make([]byte, BlockSize+1024) // Extra room for safety
+
+	for _, span := range pInfo.Spans {
+		offset := span.DataStart
+		for offset+2 <= span.DataEnd {
+			// Read stored length
+			lenBuf := make([]byte, 2)
+			if _, err := img.file.ReadAt(lenBuf, offset); err != nil {
+				return fmt.Errorf("gho: reading block length at %#x: %w", offset, err)
+			}
+			storedLen := int(binary.LittleEndian.Uint16(lenBuf))
+			if storedLen == 0 {
+				break
+			}
+			compLen := storedLen - 2
+			if compLen <= 0 || compLen > MaxStoredLen {
+				return fmt.Errorf("gho: invalid block stored_len=%d at %#x", storedLen, offset)
+			}
+
+			// Read block data
+			blockData := make([]byte, compLen)
+			if _, err := img.file.ReadAt(blockData, offset+2); err != nil {
+				return fmt.Errorf("gho: reading block data at %#x: %w", offset+2, err)
+			}
+
+			// Decompress based on compression type
+			var n int
+			var err error
+			switch img.Header.Compression {
+			case CompressionNone:
+				n = copy(dst, blockData)
+			case CompressionFast:
+				n, err = FastLZDecompress(blockData, compLen, dst)
+			default:
+				err = fmt.Errorf("%w: type %d", ErrUnsupportedCompression, img.Header.Compression)
+			}
+			if err != nil {
+				return fmt.Errorf("gho: decompressing block at %#x: %w", offset, err)
+			}
+
+			if _, err := w.Write(dst[:n]); err != nil {
+				return fmt.Errorf("gho: writing decompressed data: %w", err)
+			}
+
+			offset += 2 + int64(compLen)
+		}
+	}
+	return nil
+}
+
+// MBRPartitions returns parsed MBR partition entries from Track 0.
+func (img *Image) MBRPartitions() []MBRPartitionEntry {
+	if len(img.Track0) < 512 {
+		return nil
+	}
+	return ParseMBRPartitions(img.Track0)
+}
+
+// Summary returns a human-readable summary of the GHO image.
+func (img *Image) Summary() string {
+	s := fmt.Sprintf("GHO Image Summary\n")
+	s += fmt.Sprintf("  File Type:   %d (1=single, 9=span)\n", img.Header.FileType)
+	s += fmt.Sprintf("  Compression: %d", img.Header.Compression)
+	switch img.Header.Compression {
+	case CompressionNone:
+		s += " (none)\n"
+	case CompressionFast:
+		s += " (Fast/Z1)\n"
+	case CompressionHigh3, CompressionHigh4, CompressionHigh5,
+		CompressionHigh6, CompressionHigh7, CompressionHigh8, CompressionHigh9:
+		s += fmt.Sprintf(" (High/Z%d)\n", img.Header.Compression)
+	default:
+		s += " (unknown)\n"
+	}
+	s += fmt.Sprintf("  Image ID:    %#08x\n", img.Header.ID)
+
+	if len(img.Track0) >= 512 {
+		parts := img.MBRPartitions()
+		s += fmt.Sprintf("  MBR Partitions: %d\n", len(parts))
+		for i, p := range parts {
+			sizeMB := float64(p.LBASize) * 512 / 1024 / 1024
+			s += fmt.Sprintf("    P%d: type=%#04x LBA=%d size=%d (%.1f MB)\n",
+				i, p.Type, p.LBAStart, p.LBASize, sizeMB)
+		}
+	}
+
+	s += fmt.Sprintf("  Data Partitions: %d\n", len(img.Partitions))
+	for i, p := range img.Partitions {
+		totalSpanBytes := int64(0)
+		for _, sp := range p.Spans {
+			totalSpanBytes += sp.DataEnd - sp.DataStart
+		}
+		s += fmt.Sprintf("    Partition %d: %d spans, %d bytes compressed data\n",
+			i, len(p.Spans), totalSpanBytes)
+	}
+	return s
+}
