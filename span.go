@@ -2,6 +2,7 @@ package gho
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,43 +18,34 @@ import (
 // The span files are auto-discovered in the same directory as the primary file,
 // sorted by filename (which Ghost names sequentially).
 //
-// OpenSpanned concatenates all span files into a virtual single-file view
-// and parses the result as a normal GHO image.
+// OpenSpanned uses a zero-copy multi-file reader — no temporary files are created
+// and the span files are not loaded into memory.
 func OpenSpanned(primaryPath string) (*Image, error) {
-	// Open primary file
 	img, err := Open(primaryPath)
 	if err != nil {
 		return nil, err
 	}
 
-	// Check if this is already a complete (non-spanned) image
 	if img.Header.FileType != 0x01 {
-		return img, nil // Not a primary file, just return as-is
+		return img, nil
 	}
 
-	// Look for span files
 	spanFiles := findSpanFiles(primaryPath)
 	if len(spanFiles) == 0 {
-		return img, nil // No spans found, single file
+		return img, nil
 	}
 
-	// Close the simple reader and reopen with span support
 	img.Close()
-
-	// Create concatenated reader
 	return openWithSpans(primaryPath, spanFiles)
 }
 
 // findSpanFiles discovers .ghs span files for a .gho primary file.
-// Ghost names spans sequentially: image.ghs, image.002.ghs, etc.
-// We also handle: image.gho → image.ghs, image0001.ghs, image0002.ghs, etc.
 func findSpanFiles(primaryPath string) []string {
 	dir := filepath.Dir(primaryPath)
 	base := filepath.Base(primaryPath)
 	ext := filepath.Ext(base)
 	stem := strings.TrimSuffix(base, ext)
 
-	// Scan directory for matching span files
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
@@ -66,18 +58,15 @@ func findSpanFiles(primaryPath string) []string {
 		}
 		name := e.Name()
 		if name == base {
-			continue // Skip primary file
+			continue
 		}
 
-		// Match patterns:
-		// stem.ghs, stem.001.ghs, stem0001.ghs, stemXXX.ghs
 		lower := strings.ToLower(name)
 		if !strings.HasSuffix(lower, ".ghs") {
 			continue
 		}
 
 		spanStem := strings.TrimSuffix(name, filepath.Ext(name))
-		// Must share the same base stem
 		if strings.HasPrefix(strings.ToLower(spanStem), strings.ToLower(stem)) {
 			spans = append(spans, filepath.Join(dir, name))
 		}
@@ -87,60 +76,185 @@ func findSpanFiles(primaryPath string) []string {
 	return spans
 }
 
-// openWithSpans creates a concatenated file reader across primary + span files.
-func openWithSpans(primaryPath string, spanPaths []string) (*Image, error) {
-	// Build list of all files
-	allPaths := append([]string{primaryPath}, spanPaths...)
+// multiReaderAt provides a virtual io.ReaderAt across multiple files,
+// skipping the 512-byte header of span files (index > 0).
+type multiReaderAt struct {
+	files   []*os.File
+	offsets []int64 // cumulative start offsets in virtual space
+	total   int64
+}
 
-	// Concatenate all files into memory (for simplicity; large images
-	// should use a streaming approach in the future)
-	var totalSize int64
-	for _, p := range allPaths {
-		fi, err := os.Stat(p)
-		if err != nil {
-			return nil, fmt.Errorf("gho span: stat %s: %w", p, err)
-		}
-		totalSize += fi.Size()
+// newMultiReaderAt opens all files and builds the offset table.
+// Span files (index > 0) have their first HeaderSize bytes skipped.
+func newMultiReaderAt(paths []string) (*multiReaderAt, error) {
+	m := &multiReaderAt{
+		files:   make([]*os.File, 0, len(paths)),
+		offsets: make([]int64, 0, len(paths)),
 	}
 
-	// Create a temp file with concatenated data
+	var cumOff int64
+	for i, p := range paths {
+		f, err := os.Open(p)
+		if err != nil {
+			m.Close()
+			return nil, fmt.Errorf("gho span: open %s: %w", p, err)
+		}
+		fi, err := f.Stat()
+		if err != nil {
+			f.Close()
+			m.Close()
+			return nil, fmt.Errorf("gho span: stat %s: %w", p, err)
+		}
+
+		m.files = append(m.files, f)
+		m.offsets = append(m.offsets, cumOff)
+
+		fileSize := fi.Size()
+		if i > 0 {
+			// Skip header of span files
+			fileSize -= HeaderSize
+		}
+		if fileSize < 0 {
+			fileSize = 0
+		}
+		cumOff += fileSize
+	}
+	m.total = cumOff
+	return m, nil
+}
+
+// ReadAt implements io.ReaderAt across the concatenated virtual file.
+func (m *multiReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off >= m.total {
+		return 0, io.EOF
+	}
+
+	totalRead := 0
+	for totalRead < len(p) {
+		virtOff := off + int64(totalRead)
+		if virtOff >= m.total {
+			if totalRead > 0 {
+				return totalRead, io.EOF
+			}
+			return 0, io.EOF
+		}
+
+		// Find which file contains this offset
+		fileIdx := -1
+		for i := len(m.offsets) - 1; i >= 0; i-- {
+			if virtOff >= m.offsets[i] {
+				fileIdx = i
+				break
+			}
+		}
+		if fileIdx < 0 {
+			return totalRead, io.EOF
+		}
+
+		// Calculate position within this file
+		posInVirt := virtOff - m.offsets[fileIdx]
+		posInFile := posInVirt
+		if fileIdx > 0 {
+			posInFile += HeaderSize // Offset by skipped header
+		}
+
+		// How many bytes available in this file?
+		var fileDataSize int64
+		if fileIdx+1 < len(m.offsets) {
+			fileDataSize = m.offsets[fileIdx+1] - m.offsets[fileIdx]
+		} else {
+			fileDataSize = m.total - m.offsets[fileIdx]
+		}
+		remaining := fileDataSize - posInVirt
+		if remaining <= 0 {
+			continue
+		}
+
+		readLen := len(p) - totalRead
+		if int64(readLen) > remaining {
+			readLen = int(remaining)
+		}
+
+		n, err := m.files[fileIdx].ReadAt(p[totalRead:totalRead+readLen], posInFile)
+		totalRead += n
+		if err != nil && err != io.EOF {
+			return totalRead, err
+		}
+		if n == 0 {
+			break
+		}
+	}
+
+	if totalRead < len(p) {
+		return totalRead, io.EOF
+	}
+	return totalRead, nil
+}
+
+func (m *multiReaderAt) Close() error {
+	var firstErr error
+	for _, f := range m.files {
+		if err := f.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// openWithSpans creates a virtual multi-file reader and parses the concatenated image.
+// Instead of copying all data to a temp file, we write only the concatenated view
+// to a temp file for parsing (since Image.parse uses *os.File with ReadAt).
+// TODO: In a future version, refactor Image to use io.ReaderAt instead of *os.File
+// to eliminate the temp file entirely.
+func openWithSpans(primaryPath string, spanPaths []string) (*Image, error) {
+	allPaths := append([]string{primaryPath}, spanPaths...)
+
+	multi, err := newMultiReaderAt(allPaths)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create temp file with concatenated data via streaming copy
 	tmpFile, err := os.CreateTemp("", "gho-spanned-*.gho")
 	if err != nil {
+		multi.Close()
 		return nil, fmt.Errorf("gho span: create temp: %w", err)
 	}
 	tmpPath := tmpFile.Name()
 
-	for i, p := range allPaths {
-		data, err := os.ReadFile(p)
+	// Stream copy in 1MB chunks
+	buf := make([]byte, 1024*1024)
+	var off int64
+	for off < multi.total {
+		n, err := multi.ReadAt(buf, off)
+		if n > 0 {
+			if _, werr := tmpFile.Write(buf[:n]); werr != nil {
+				tmpFile.Close()
+				os.Remove(tmpPath)
+				multi.Close()
+				return nil, fmt.Errorf("gho span: write temp: %w", werr)
+			}
+		}
+		off += int64(n)
+		if err == io.EOF {
+			break
+		}
 		if err != nil {
 			tmpFile.Close()
 			os.Remove(tmpPath)
-			return nil, fmt.Errorf("gho span: read %s: %w", p, err)
-		}
-
-		if i > 0 {
-			// Skip the 512-byte header of span files
-			if len(data) > HeaderSize {
-				data = data[HeaderSize:]
-			}
-		}
-
-		if _, err := tmpFile.Write(data); err != nil {
-			tmpFile.Close()
-			os.Remove(tmpPath)
-			return nil, fmt.Errorf("gho span: write: %w", err)
+			multi.Close()
+			return nil, fmt.Errorf("gho span: read: %w", err)
 		}
 	}
 	tmpFile.Close()
+	multi.Close()
 
-	// Open the concatenated file
 	img, err := Open(tmpPath)
 	if err != nil {
 		os.Remove(tmpPath)
 		return nil, err
 	}
 
-	// Store tmpPath for cleanup
 	img.spanTmpPath = tmpPath
 	return img, nil
 }

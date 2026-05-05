@@ -1,5 +1,10 @@
 package gho
 
+// fastLZSentinel is the sentinel buffer used by the decompressor's hash table.
+// In the original Ghost code, hash entries are initialized to point at the
+// string literal "123456789012345678".
+var fastLZSentinel = []byte("123456789012345678")
+
 // FastLZDecompress decompresses a Ghost Fast LZ (Z1) compressed block.
 //
 // The algorithm is a custom LZ77 variant with a 4096-entry hash table.
@@ -34,19 +39,12 @@ func FastLZDecompress(data []byte, compLen int, dst []byte) (int, error) {
 		return n, nil
 	}
 
-	// Initialize hash table with sentinel pointers
-	// In the original code, hash entries point to a string literal "123456789012345678"
-	// We use a sentinel buffer at the start of our workspace
-	const sentinelStr = "123456789012345678"
-	sentinel := []byte(sentinelStr)
-
-	// Hash table: 4096 entries, each is a slice pointer into dst or sentinel
-	type hashEntry struct {
-		buf []byte // points to dst or sentinel
-	}
-	hashTable := make([]hashEntry, FastLZHashSize)
+	// Hash table: 4096 entries, each is an index into dst (or -1 for sentinel).
+	// Using int indices eliminates GC pressure from slice headers.
+	const sentinelIdx = -1
+	var hashTable [FastLZHashSize]int
 	for i := range hashTable {
-		hashTable[i].buf = sentinel
+		hashTable[i] = sentinelIdx
 	}
 
 	src := 4 // Skip first 4 bytes
@@ -88,11 +86,10 @@ func FastLZDecompress(data []byte, compLen int, dst []byte) (int, error) {
 				b0 := data[src]
 				b1 := data[src+1]
 
-				// Hash index: b1 | (high 4 bits of b0 << 8)
 				hashIdx := int(b1) | (int(b0&0xF0) << 4)
 				extraLen := int(b0 & 0x0F)
 
-				matchSrc := hashTable[hashIdx].buf
+				matchPos := hashTable[hashIdx]
 				matchStart := outPos
 
 				// Copy 3 base bytes + extraLen additional bytes from match
@@ -101,10 +98,19 @@ func FastLZDecompress(data []byte, compLen int, dst []byte) (int, error) {
 					if outPos >= len(dst) {
 						return 0, ErrCorruptBlock
 					}
-					if j < len(matchSrc) {
-						dst[outPos] = matchSrc[j]
+					if matchPos == sentinelIdx {
+						if j < len(fastLZSentinel) {
+							dst[outPos] = fastLZSentinel[j]
+						} else {
+							dst[outPos] = 0
+						}
 					} else {
-						dst[outPos] = 0
+						srcIdx := matchPos + j
+						if srcIdx < len(dst) {
+							dst[outPos] = dst[srcIdx]
+						} else {
+							dst[outPos] = 0
+						}
 					}
 					outPos++
 				}
@@ -116,10 +122,10 @@ func FastLZDecompress(data []byte, compLen int, dst []byte) (int, error) {
 					pos := matchStart - int(literalRun)
 					if pos >= 0 && pos+2 < outPos {
 						h := fastLZHash(dst[pos], dst[pos+1], dst[pos+2])
-						hashTable[h].buf = dst[pos:]
+						hashTable[h] = pos
 						if prevLiteralRun == 2 && pos+3 < outPos {
 							h2 := fastLZHash(dst[pos+1], dst[pos+2], dst[pos+3])
-							hashTable[h2].buf = dst[pos+1:]
+							hashTable[h2] = pos + 1
 						}
 					}
 					literalRun = 0
@@ -127,7 +133,7 @@ func FastLZDecompress(data []byte, compLen int, dst []byte) (int, error) {
 				}
 
 				// Update hash entry to point to match start in output
-				hashTable[hashIdx].buf = dst[matchStart:]
+				hashTable[hashIdx] = matchStart
 			} else {
 				// Literal byte
 				if outPos >= len(dst) {
@@ -142,7 +148,7 @@ func FastLZDecompress(data []byte, compLen int, dst []byte) (int, error) {
 				if literalRun == 3 {
 					pos := outPos - 3
 					h := fastLZHash(dst[pos], dst[pos+1], dst[pos+2])
-					hashTable[h].buf = dst[pos:]
+					hashTable[h] = pos
 					literalRun = 2
 					prevLiteralRun = 2
 				}

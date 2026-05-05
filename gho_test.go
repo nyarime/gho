@@ -2,6 +2,7 @@ package gho
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"testing"
 )
@@ -325,6 +326,39 @@ func TestCRC16Cipher(t *testing.T) {
 
 	if !bytes.Equal(data, original) {
 		t.Errorf("decrypt mismatch: got %q, want %q", data, original)
+	}
+}
+
+func BenchmarkDecompressPartition(b *testing.B) {
+	if _, err := os.Stat(testGHO); err != nil {
+		b.Skipf("test GHO not found: %s", testGHO)
+	}
+
+	img, err := Open(testGHO)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer img.Close()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := img.DecompressPartition(0, io.Discard); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkFastLZCompress(b *testing.B) {
+	// 32KB block of realistic data
+	src := make([]byte, BlockSize)
+	for i := range src {
+		src[i] = byte(i % 251)
+	}
+
+	b.ResetTimer()
+	b.SetBytes(BlockSize)
+	for i := 0; i < b.N; i++ {
+		FastLZCompress(src)
 	}
 }
 

@@ -9,14 +9,16 @@ import (
 
 // Image represents a parsed GHO image file.
 type Image struct {
-	Header     *FileHeader
-	Track0     []byte             // Raw Track 0 data (MBR at offset 6)
-	Track0Hdr  Track0Header       // 6-byte mini-header
-	Partitions []PartitionInfo    // Partition descriptors
-	EndRecord  *Record
-	file       *os.File
-	password   string             // For encrypted images
-	spanTmpPath string            // Temp file for spanned images (cleaned up on Close)
+	Header      *FileHeader
+	Track0      []byte          // Raw Track 0 data (MBR at offset 6)
+	Track0Hdr   Track0Header    // 6-byte mini-header
+	Partitions  []PartitionInfo // Partition descriptors
+	EndRecord   *Record
+	file        *os.File
+	fileLen     int64  // Cached file size
+	password    string // For encrypted images
+	spanTmpPath string // Temp file for spanned images (cleaned up on Close)
+	spanReader  io.Closer // For multiReaderAt cleanup
 }
 
 // PartitionInfo holds information about a single partition in the image.
@@ -27,6 +29,15 @@ type PartitionInfo struct {
 	DescBody   [20]byte         // Raw descriptor body
 }
 
+// TotalCompressedSize returns the total compressed data size across all spans.
+func (p *PartitionInfo) TotalCompressedSize() int64 {
+	var total int64
+	for _, sp := range p.Spans {
+		total += sp.DataEnd - sp.DataStart
+	}
+	return total
+}
+
 // Open opens and parses a GHO image file.
 func Open(path string) (*Image, error) {
 	f, err := os.Open(path)
@@ -34,7 +45,13 @@ func Open(path string) (*Image, error) {
 		return nil, err
 	}
 
-	img := &Image{file: f}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+
+	img := &Image{file: f, fileLen: fi.Size()}
 	if err := img.parse(); err != nil {
 		f.Close()
 		return nil, err
@@ -56,6 +73,9 @@ func (img *Image) IsEncrypted() bool {
 // Close closes the underlying file and cleans up temporary span files.
 func (img *Image) Close() error {
 	var err error
+	if img.spanReader != nil {
+		img.spanReader.Close()
+	}
 	if img.file != nil {
 		err = img.file.Close()
 	}
@@ -77,20 +97,22 @@ func (img *Image) parse() error {
 		return err
 	}
 
+	// Pre-allocate reusable buffers for record scanning
+	recBuf := make([]byte, RecordHeaderSize)
+	scanBuf := make([]byte, scanChunkSize+10) // Reusable scan buffer
+
 	// Scan records by finding record magic
 	offset := int64(HeaderSize)
 	for {
-		// Find next record by scanning for magic
-		recOff, err := img.findNextRecord(offset)
+		recOff, err := img.findNextRecord(offset, scanBuf)
 		if err != nil {
 			return err
 		}
-		if recOff >= img.fileSize() {
+		if recOff >= img.fileLen {
 			break
 		}
 		offset = recOff
 
-		recBuf := make([]byte, RecordHeaderSize)
 		if _, err := img.file.ReadAt(recBuf, offset); err != nil {
 			if err == io.EOF {
 				break
@@ -105,7 +127,6 @@ func (img *Image) parse() error {
 
 		switch rec.TypeCode() {
 		case RecordTypeTrack0:
-			// Read Track 0 data (6-byte header + MBR + remaining sectors)
 			body := make([]byte, rec.BodyLen)
 			if _, err := img.file.ReadAt(body, offset+RecordHeaderSize); err != nil {
 				return fmt.Errorf("gho: reading Track0 body: %w", err)
@@ -121,7 +142,6 @@ func (img *Image) parse() error {
 			offset += RecordHeaderSize + int64(rec.BodyLen)
 
 		case RecordTypePartition:
-			// Read partition descriptor
 			pInfo := PartitionInfo{Descriptor: rec}
 			body := make([]byte, rec.BodyLen)
 			if _, err := img.file.ReadAt(body, offset+RecordHeaderSize); err != nil {
@@ -130,7 +150,6 @@ func (img *Image) parse() error {
 			copy(pInfo.DescBody[:], body)
 			offset += RecordHeaderSize + int64(rec.BodyLen)
 
-			// Read FEEF partition header
 			feefBuf := make([]byte, HeaderSize)
 			if _, err := img.file.ReadAt(feefBuf, offset); err != nil {
 				return fmt.Errorf("gho: reading FEEF header: %w", err)
@@ -142,8 +161,7 @@ func (img *Image) parse() error {
 			offset += HeaderSize
 			dataStart := offset
 
-			// Scan forward to find the next record
-			nextRecOff, err := img.findNextRecord(offset)
+			nextRecOff, err := img.findNextRecord(offset, scanBuf)
 			if err != nil {
 				return err
 			}
@@ -152,24 +170,21 @@ func (img *Image) parse() error {
 			img.Partitions = append(img.Partitions, pInfo)
 
 		case RecordTypeContinuation:
-			// Add span to last partition
 			body := make([]byte, rec.BodyLen)
 			if _, err := img.file.ReadAt(body, offset+RecordHeaderSize); err != nil {
 				return fmt.Errorf("gho: reading continuation body: %w", err)
 			}
 			offset += RecordHeaderSize + int64(rec.BodyLen)
 
-			// Check for optional FEEF header
 			checkBuf := make([]byte, 4)
 			if _, err := img.file.ReadAt(checkBuf, offset); err == nil {
 				if binary.LittleEndian.Uint16(checkBuf[0:2]) == FileMagic {
-					offset += HeaderSize // Skip FEEF header
+					offset += HeaderSize
 				}
 			}
 			dataStart := offset
 
-			// Find next record
-			nextRecOff, err := img.findNextRecord(offset)
+			nextRecOff, err := img.findNextRecord(offset, scanBuf)
 			if err != nil {
 				return err
 			}
@@ -182,41 +197,25 @@ func (img *Image) parse() error {
 
 		case RecordTypeEnd:
 			img.EndRecord = rec
-			return nil // Done
+			return nil
 
 		default:
-			// Skip unknown records
 			offset += RecordHeaderSize + int64(rec.BodyLen)
 		}
 	}
 	return nil
 }
 
-func (img *Image) fileSize() int64 {
-	fi, err := img.file.Stat()
-	if err != nil {
-		return 0
-	}
-	return fi.Size()
-}
+const scanChunkSize = 65536
 
 // findNextRecord scans forward from offset to find the next record header.
 // Records are identified by the magic value 0x012F18D8 at offset 4.
-func (img *Image) findNextRecord(startOff int64) (int64, error) {
-	// Read chunks and scan for record magic
-	const chunkSize = 65536
-	buf := make([]byte, chunkSize+10) // Extra bytes for cross-boundary matching
-
-	fi, err := img.file.Stat()
-	if err != nil {
-		return 0, err
-	}
-	fileSize := fi.Size()
-
-	for off := startOff; off < fileSize; {
-		readLen := int64(chunkSize)
-		if off+readLen > fileSize {
-			readLen = fileSize - off
+// buf must be at least scanChunkSize+10 bytes.
+func (img *Image) findNextRecord(startOff int64, buf []byte) (int64, error) {
+	for off := startOff; off < img.fileLen; {
+		readLen := int64(scanChunkSize)
+		if off+readLen > img.fileLen {
+			readLen = img.fileLen - off
 		}
 		n, err := img.file.ReadAt(buf[:readLen], off)
 		if err != nil && err != io.EOF {
@@ -226,18 +225,29 @@ func (img *Image) findNextRecord(startOff int64) (int64, error) {
 			break
 		}
 
-		// Scan for record magic at aligned positions
-		// Records can appear at any byte offset
 		for i := 0; i <= n-RecordHeaderSize; i++ {
 			magic := binary.LittleEndian.Uint32(buf[i+4 : i+8])
 			if magic == RecordMagic {
-				return off + int64(i), nil
+				// Validate record type to reduce false positives
+				recType := binary.LittleEndian.Uint16(buf[i : i+2])
+				if isKnownRecordType(recType) {
+					return off + int64(i), nil
+				}
 			}
 		}
 		off += int64(n - 10) // Overlap to catch cross-boundary matches
 	}
 
-	return fileSize, nil // End of file
+	return img.fileLen, nil
+}
+
+// isKnownRecordType returns true if the type code is a recognized GHO record type.
+func isKnownRecordType(t uint16) bool {
+	switch t {
+	case RecordTypeTrack0, RecordTypePartition, RecordTypeContinuation, RecordTypeEnd:
+		return true
+	}
+	return false
 }
 
 // DecompressPartition decompresses all blocks of a partition and writes to w.
@@ -247,7 +257,6 @@ func (img *Image) DecompressPartition(partIdx int, w io.Writer) error {
 		return fmt.Errorf("gho: partition index %d out of range", partIdx)
 	}
 
-	// Initialize decryption cipher if encrypted
 	var cipher *CRC16Cipher
 	if img.IsEncrypted() {
 		if img.password == "" {
@@ -261,13 +270,13 @@ func (img *Image) DecompressPartition(partIdx int, w io.Writer) error {
 	}
 
 	pInfo := &img.Partitions[partIdx]
-	dst := make([]byte, BlockSize+1024) // Extra room for safety
+	dst := make([]byte, BlockSize+1024) // Decompression output buffer
+	lenBuf := make([]byte, 2)           // Reusable length buffer
+	blockBuf := make([]byte, MaxStoredLen) // Reusable block read buffer
 
 	for _, span := range pInfo.Spans {
 		offset := span.DataStart
 		for offset+2 <= span.DataEnd {
-			// Read stored length
-			lenBuf := make([]byte, 2)
 			if _, err := img.file.ReadAt(lenBuf, offset); err != nil {
 				return fmt.Errorf("gho: reading block length at %#x: %w", offset, err)
 			}
@@ -280,18 +289,16 @@ func (img *Image) DecompressPartition(partIdx int, w io.Writer) error {
 				return fmt.Errorf("gho: invalid block stored_len=%d at %#x", storedLen, offset)
 			}
 
-			// Read block data
-			blockData := make([]byte, compLen)
+			// Read block data into reusable buffer
+			blockData := blockBuf[:compLen]
 			if _, err := img.file.ReadAt(blockData, offset+2); err != nil {
 				return fmt.Errorf("gho: reading block data at %#x: %w", offset+2, err)
 			}
 
-			// Decrypt block data if encrypted
 			if cipher != nil {
 				cipher.Decrypt(blockData)
 			}
 
-			// Decompress based on compression type
 			var n int
 			var err error
 			switch img.Header.Compression {
@@ -317,6 +324,12 @@ func (img *Image) DecompressPartition(partIdx int, w io.Writer) error {
 		}
 	}
 	return nil
+}
+
+// Verify checks the integrity of a partition by decompressing all blocks
+// without writing output. Returns nil if all blocks decompress successfully.
+func (img *Image) Verify(partIdx int) error {
+	return img.DecompressPartition(partIdx, io.Discard)
 }
 
 // MBRPartitions returns parsed MBR partition entries from Track 0.
@@ -357,12 +370,8 @@ func (img *Image) Summary() string {
 
 	s += fmt.Sprintf("  Data Partitions: %d\n", len(img.Partitions))
 	for i, p := range img.Partitions {
-		totalSpanBytes := int64(0)
-		for _, sp := range p.Spans {
-			totalSpanBytes += sp.DataEnd - sp.DataStart
-		}
 		s += fmt.Sprintf("    Partition %d: %d spans, %d bytes compressed data\n",
-			i, len(p.Spans), totalSpanBytes)
+			i, len(p.Spans), p.TotalCompressedSize())
 	}
 	return s
 }

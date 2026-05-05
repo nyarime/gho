@@ -12,7 +12,6 @@ func FastLZCompress(src []byte) []byte {
 		return nil
 	}
 	if len(src) < 18 {
-		// Too short to compress meaningfully
 		return fastLZStoreUncompressed(src)
 	}
 
@@ -32,37 +31,29 @@ func fastLZStoreUncompressed(src []byte) []byte {
 
 func fastLZCompressInner(src []byte) []byte {
 	n := len(src)
-	// Worst case: 4-byte header + (n * 9/8) for control words + data
 	out := make([]byte, 0, 4+n+n/8+64)
-	out = append(out, 0, 0, 0, 0) // 4-byte header (byte[0] != 1 = compressed)
+	out = append(out, 0, 0, 0, 0) // 4-byte header
 
-	// Hash table: mirrors the decompressor's hash table exactly.
-	// In the decompressor, entries point into dst (output) buffer.
-	// Here, entries point into src (input) buffer — same data.
-	const hashSize = FastLZHashSize // 4096
+	const hashSize = FastLZHashSize
 	const sentinel = -1
-	hashTable := make([]int, hashSize) // position in src, or sentinel
+	var hashTable [hashSize]int
 	for i := range hashTable {
 		hashTable[i] = sentinel
 	}
 
-	// We emit 16-bit control words. Each bit: 0=literal, 1=match.
-	// We buffer up to 16 tokens, then write the control word + token data.
-
-	pos := 0 // current position in src
-
-	// Mirror decompressor state
+	pos := 0
 	var literalRun uint16
 	var prevLiteralRun uint16
 
+	// Pre-allocate token buffer (max 16 tokens × 2 bytes each)
+	tokenData := make([]byte, 0, 34)
+
 	for pos < n {
-		// Start a new 16-token group
 		var controlBits uint16
-		var tokenData []byte
+		tokenData = tokenData[:0]
 		tokenCount := 0
 
 		for tokenCount < 16 && pos < n {
-			// Try to find a match
 			matchLen := 0
 			matchHashIdx := 0
 
@@ -71,9 +62,8 @@ func fastLZCompressInner(src []byte) []byte {
 				matchPos := hashTable[h]
 
 				if matchPos != sentinel && matchPos >= 0 && matchPos < pos {
-					// Check how many bytes match
 					ml := 0
-					maxMatch := 18 // 3 base + 15 extra (4-bit extraLen max)
+					maxMatch := 18
 					if pos+maxMatch > n {
 						maxMatch = n - pos
 					}
@@ -88,7 +78,6 @@ func fastLZCompressInner(src []byte) []byte {
 			}
 
 			if matchLen >= 3 {
-				// === EMIT MATCH ===
 				extraLen := matchLen - 3
 				b0 := byte(extraLen&0x0F) | byte((matchHashIdx>>4)&0xF0)
 				b1 := byte(matchHashIdx & 0xFF)
@@ -97,13 +86,8 @@ func fastLZCompressInner(src []byte) []byte {
 				controlBits |= 1 << uint(tokenCount)
 
 				matchStart := pos
-
-				// Advance pos by matchLen (the decompressor outputs matchLen bytes)
 				pos += matchLen
 
-				// --- Mirror decompressor hash updates on match ---
-
-				// 1) Update hash for accumulated literal run (before match)
 				if literalRun > 0 {
 					litPos := matchStart - int(literalRun)
 					if litPos >= 0 && litPos+2 < pos {
@@ -118,13 +102,9 @@ func fastLZCompressInner(src []byte) []byte {
 					prevLiteralRun = 0
 				}
 
-				// 2) Update hash entry to point to match start
 				hashTable[matchHashIdx] = matchStart
-
 			} else {
-				// === EMIT LITERAL ===
 				tokenData = append(tokenData, src[pos])
-				// control bit stays 0
 
 				literalRun++
 				pos++
@@ -142,7 +122,6 @@ func fastLZCompressInner(src []byte) []byte {
 			tokenCount++
 		}
 
-		// Write control word + token data
 		out = append(out, byte(controlBits), byte(controlBits>>8))
 		out = append(out, tokenData...)
 	}
