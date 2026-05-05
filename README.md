@@ -12,6 +12,8 @@ No C dependencies. No CGo. Single binary.
 
 - Parse GHO file/partition headers and record structure
 - Decompress **Fast LZ (Z1)** compressed partitions
+- **Create** GHO images from raw partition data
+- **Fixup** GHO headers (ghofixup.exe equivalent — CD/span flag modification with PRNG cipher)
 - Extract MBR/Track 0 data and partition table
 - Stream decompression (constant memory, arbitrary image sizes)
 - Supports Ghost 11.x–12.x format
@@ -34,6 +36,14 @@ gho info disk.gho
 
 # Extract all partitions to a directory
 gho extract disk.gho output/
+
+# Create a GHO image from a partition image (+ optional MBR)
+gho create output.gho partition.img mbr.bin
+
+# Modify header flags (ghofixup.exe equivalent)
+gho fixup disk.gho cd      # Set spanned/CD bit
+gho fixup disk.gho cd-     # Clear spanned/CD bit
+gho fixup disk.gho span    # Toggle CD flag
 ```
 
 Example output:
@@ -88,6 +98,25 @@ func main() {
     }
     fmt.Printf("Decompressed: %d bytes\n", buf.Len())
 }
+```
+
+### Create a GHO Image
+
+```go
+w, _ := gho.Create("output.gho", gho.CompressionNone)
+w.WriteTrack0(mbrData, 63)  // MBR + boot sectors
+w.WritePartition(partFile)    // raw partition data (io.Reader)
+w.Close()
+```
+
+### Modify Header Flags (ghofixup)
+
+```go
+// Set CD/spanned bit (like ghofixup.exe cd)
+gho.ModifyHeader("disk.gho", gho.FixupCD)
+
+// Toggle span flag
+gho.ModifyHeader("disk.gho", gho.FixupSpan)
 ```
 
 ## GHO Format
@@ -146,11 +175,11 @@ The Fast LZ decompressor was reverse-engineered from Norton Ghost 11.5.1. It's a
 
 Contributions welcome! Areas that need work:
 
+- **Fast LZ compressor**: Currently writes uncompressed blocks; implementing the Fast LZ compressor requires exact hash table synchronization with the decompressor
 - **Zlib/High compression** (Z3–Z9): Add `compress/flate` decompression path
 - **Span file support**: Handle `.ghs` continuation files
 - **Encryption**: CRC-16 stream cipher decryption
 - **Full disk images**: Currently supports partition-level images; whole-disk with MBR rebuild is planned
-- **Writer**: GHO image creation (Fast LZ compressor)
 
 ## License
 
