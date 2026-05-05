@@ -124,6 +124,10 @@ func (gw *Writer) writeBlock(data []byte) error {
 		blockData = data
 	case CompressionFast:
 		blockData = FastLZCompress(data)
+	case CompressionHigh3, CompressionHigh4, CompressionHigh5,
+		CompressionHigh6, CompressionHigh7, CompressionHigh8, CompressionHigh9:
+		level := int(gw.compression) // Z3=level 3, Z9=level 9
+		blockData = ZlibCompress(data, level)
 	default:
 		return fmt.Errorf("gho: unsupported compression for writing: %d", gw.compression)
 	}

@@ -128,3 +128,109 @@ func TestFastLZHash(t *testing.T) {
 		t.Errorf("hash not deterministic: %d vs %d", h1, h2)
 	}
 }
+
+func TestZlibRoundtrip(t *testing.T) {
+	// Create test data with some repetition (compressible)
+	src := make([]byte, BlockSize)
+	for i := range src {
+		src[i] = byte(i % 251) // Prime modulus for variety
+	}
+
+	for _, level := range []int{3, 6, 9} {
+		compressed := ZlibCompress(src, level)
+		if compressed == nil {
+			t.Fatalf("ZlibCompress level %d returned nil", level)
+		}
+
+		dst := make([]byte, BlockSize+1024)
+		n, err := ZlibDecompress(compressed, len(compressed), dst)
+		if err != nil {
+			t.Fatalf("ZlibDecompress level %d: %v", level, err)
+		}
+		if n != BlockSize {
+			t.Errorf("ZlibDecompress level %d: got %d bytes, want %d", level, n, BlockSize)
+		}
+		for i := 0; i < n; i++ {
+			if dst[i] != src[i] {
+				t.Errorf("ZlibDecompress level %d: mismatch at byte %d", level, i)
+				break
+			}
+		}
+	}
+}
+
+func TestCRC16Cipher(t *testing.T) {
+	// Test encrypt/decrypt roundtrip
+	original := []byte("Hello, Ghost encryption test! 1234567890")
+	data := make([]byte, len(original))
+	copy(data, original)
+
+	password := "testpassword"
+
+	enc, _ := NewCRC16Cipher(password)
+	enc.Encrypt(data)
+
+	// Encrypted data should differ
+	if bytes.Equal(data, original) {
+		t.Error("encrypted data matches original")
+	}
+
+	dec, _ := NewCRC16Cipher(password)
+	dec.Decrypt(data)
+
+	if !bytes.Equal(data, original) {
+		t.Errorf("decrypt mismatch: got %q, want %q", data, original)
+	}
+}
+
+func TestWriterRoundtrip(t *testing.T) {
+	if _, err := os.Stat(testGHO); err != nil {
+		t.Skipf("test GHO not found: %s", testGHO)
+	}
+
+	// Extract original
+	img, err := Open(testGHO)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	var origBuf bytes.Buffer
+	if err := img.DecompressPartition(0, &origBuf); err != nil {
+		t.Fatalf("DecompressPartition: %v", err)
+	}
+	origTrack0 := make([]byte, len(img.Track0))
+	copy(origTrack0, img.Track0)
+	img.Close()
+
+	// Create new GHO
+	tmpFile, err := os.CreateTemp("", "gho-roundtrip-*.gho")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	w, err := NewWriter(tmpFile, CompressionNone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.WriteTrack0(origTrack0, 63)
+	w.WritePartition(bytes.NewReader(origBuf.Bytes()))
+	w.Close()
+
+	// Re-read and compare
+	img2, err := Open(tmpPath)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer img2.Close()
+
+	var rtBuf bytes.Buffer
+	if err := img2.DecompressPartition(0, &rtBuf); err != nil {
+		t.Fatalf("DecompressPartition roundtrip: %v", err)
+	}
+
+	if !bytes.Equal(origBuf.Bytes(), rtBuf.Bytes()) {
+		t.Errorf("roundtrip mismatch: orig=%d bytes, roundtrip=%d bytes",
+			origBuf.Len(), rtBuf.Len())
+	}
+}

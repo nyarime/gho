@@ -15,6 +15,8 @@ type Image struct {
 	Partitions []PartitionInfo    // Partition descriptors
 	EndRecord  *Record
 	file       *os.File
+	password   string             // For encrypted images
+	spanTmpPath string            // Temp file for spanned images (cleaned up on Close)
 }
 
 // PartitionInfo holds information about a single partition in the image.
@@ -40,12 +42,27 @@ func Open(path string) (*Image, error) {
 	return img, nil
 }
 
-// Close closes the underlying file.
+// SetPassword sets the decryption password for encrypted GHO images.
+// Must be called before DecompressPartition on encrypted images.
+func (img *Image) SetPassword(password string) {
+	img.password = password
+}
+
+// IsEncrypted returns true if the image header indicates encryption.
+func (img *Image) IsEncrypted() bool {
+	return IsEncrypted(img.Header.Raw[:])
+}
+
+// Close closes the underlying file and cleans up temporary span files.
 func (img *Image) Close() error {
+	var err error
 	if img.file != nil {
-		return img.file.Close()
+		err = img.file.Close()
 	}
-	return nil
+	if img.spanTmpPath != "" {
+		os.Remove(img.spanTmpPath)
+	}
+	return err
 }
 
 func (img *Image) parse() error {
@@ -224,9 +241,23 @@ func (img *Image) findNextRecord(startOff int64) (int64, error) {
 }
 
 // DecompressPartition decompresses all blocks of a partition and writes to w.
+// If the image is encrypted, SetPassword must be called first.
 func (img *Image) DecompressPartition(partIdx int, w io.Writer) error {
 	if partIdx >= len(img.Partitions) {
 		return fmt.Errorf("gho: partition index %d out of range", partIdx)
+	}
+
+	// Initialize decryption cipher if encrypted
+	var cipher *CRC16Cipher
+	if img.IsEncrypted() {
+		if img.password == "" {
+			return fmt.Errorf("gho: image is encrypted but no password set (call SetPassword)")
+		}
+		var err error
+		cipher, err = NewCRC16Cipher(img.password)
+		if err != nil {
+			return err
+		}
 	}
 
 	pInfo := &img.Partitions[partIdx]
@@ -255,6 +286,11 @@ func (img *Image) DecompressPartition(partIdx int, w io.Writer) error {
 				return fmt.Errorf("gho: reading block data at %#x: %w", offset+2, err)
 			}
 
+			// Decrypt block data if encrypted
+			if cipher != nil {
+				cipher.Decrypt(blockData)
+			}
+
 			// Decompress based on compression type
 			var n int
 			var err error
@@ -263,6 +299,9 @@ func (img *Image) DecompressPartition(partIdx int, w io.Writer) error {
 				n = copy(dst, blockData)
 			case CompressionFast:
 				n, err = FastLZDecompress(blockData, compLen, dst)
+			case CompressionHigh3, CompressionHigh4, CompressionHigh5,
+				CompressionHigh6, CompressionHigh7, CompressionHigh8, CompressionHigh9:
+				n, err = ZlibDecompress(blockData, compLen, dst)
 			default:
 				err = fmt.Errorf("%w: type %d", ErrUnsupportedCompression, img.Header.Compression)
 			}

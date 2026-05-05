@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/nyarime/gho"
 )
@@ -32,10 +33,11 @@ func main() {
 		cmdInfo(os.Args[2])
 	case "extract":
 		if len(os.Args) < 4 {
-			fmt.Fprintln(os.Stderr, "usage: gho extract <image.gho> <output-dir>")
+			fmt.Fprintln(os.Stderr, "usage: gho extract <image.gho> <output-dir> [--password=PWD] [--spanned]")
 			os.Exit(1)
 		}
-		cmdExtract(os.Args[2], os.Args[3])
+		password, spanned := parseFlags(os.Args[4:])
+		cmdExtract(os.Args[2], os.Args[3], password, spanned)
 	case "create":
 		if len(os.Args) < 4 {
 			fmt.Fprintln(os.Stderr, "usage: gho create <output.gho> <partition.img> [mbr.bin]")
@@ -63,9 +65,13 @@ func usage() {
 
 Usage:
   gho info    <image.gho>                          Show image metadata and partition layout
-  gho extract <image.gho> <out-dir>                Extract decompressed partition images
+  gho extract <image.gho> <out-dir> [options]      Extract decompressed partition images
   gho create  <output.gho> <partition.img> [mbr]   Create a GHO from partition image
   gho fixup   <image.gho> <cd|cd-|span>            Modify header flags (ghofixup.exe equivalent)
+
+Extract options:
+  --password=PWD   Decrypt encrypted images
+  --spanned        Auto-discover .ghs span files
 
 Fixup modes:
   cd     Set the spanned/CD bit (offset 584)
@@ -73,6 +79,18 @@ Fixup modes:
   span   Toggle the CD flag (offset 55)
 
 `)
+}
+
+func parseFlags(args []string) (password string, spanned bool) {
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--password=") {
+			password = strings.TrimPrefix(arg, "--password=")
+		}
+		if arg == "--spanned" {
+			spanned = true
+		}
+	}
+	return
 }
 
 func cmdInfo(path string) {
@@ -97,18 +115,32 @@ func cmdInfo(path string) {
 	}
 }
 
-func cmdExtract(ghoPath, outDir string) {
+func cmdExtract(ghoPath, outDir, password string, spanned bool) {
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
-	img, err := gho.Open(ghoPath)
+	var img *gho.Image
+	var err error
+	if spanned {
+		img, err = gho.OpenSpanned(ghoPath)
+	} else {
+		img, err = gho.Open(ghoPath)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 	defer img.Close()
+
+	if password != "" {
+		img.SetPassword(password)
+	}
+
+	if img.IsEncrypted() && password == "" {
+		fmt.Fprintln(os.Stderr, "warning: image is encrypted, use --password=PWD to decrypt")
+	}
 
 	fmt.Print(img.Summary())
 
