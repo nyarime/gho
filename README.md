@@ -166,7 +166,7 @@ The Fast LZ decompressor was reverse-engineered from Norton Ghost 11.5.1. It's a
 | Ghost Version | Compression | Status |
 |---|---|---|
 | 11.x–12.x | None (Z0) | ✅ Read + Write |
-| 11.x–12.x | Fast LZ (Z1) | ✅ Read, Write (uncompressed blocks) |
+|| 11.x–12.x | Fast LZ (Z1) | ✅ Read + Write |
 | 11.x–12.x | High/zlib (Z3–Z9) | ✅ Read + Write |
 | Encrypted images | CRC-16 cipher | ✅ Read + Write |
 | Span files (.ghs) | Multi-file | ✅ Read |
@@ -175,7 +175,6 @@ The Fast LZ decompressor was reverse-engineered from Norton Ghost 11.5.1. It's a
 
 Contributions welcome! Areas that need work:
 
-- **Fast LZ compressor**: Currently writes uncompressed blocks; the compressor requires exact hash table state mirroring with the decompressor
 - **Span file writing**: Creating multi-file (.ghs) span images
 - **Full disk images**: Currently supports partition-level images; whole-disk with MBR rebuild is planned
 

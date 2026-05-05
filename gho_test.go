@@ -129,6 +129,151 @@ func TestFastLZHash(t *testing.T) {
 	}
 }
 
+func TestFastLZCompressRoundtrip(t *testing.T) {
+	// Test with various data patterns
+	tests := []struct {
+		name string
+		data func() []byte
+	}{
+		{"zeros", func() []byte { return make([]byte, 4096) }},
+		{"sequential", func() []byte {
+			d := make([]byte, 4096)
+			for i := range d {
+				d[i] = byte(i)
+			}
+			return d
+		}},
+		{"repetitive", func() []byte {
+			d := make([]byte, 4096)
+			for i := range d {
+				d[i] = byte(i % 7)
+			}
+			return d
+		}},
+		{"block_size", func() []byte {
+			d := make([]byte, BlockSize)
+			for i := range d {
+				d[i] = byte(i % 251)
+			}
+			return d
+		}},
+		{"highly_compressible", func() []byte {
+			d := make([]byte, BlockSize)
+			copy(d, []byte("ABCDEFGHIJKLMNOP"))
+			for i := 16; i < len(d); i += 16 {
+				copy(d[i:], d[:16])
+			}
+			return d
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := tt.data()
+			compressed := FastLZCompress(src)
+			if compressed == nil {
+				t.Fatal("FastLZCompress returned nil")
+			}
+
+			dst := make([]byte, len(src)+1024)
+			n, err := FastLZDecompress(compressed, len(compressed), dst)
+			if err != nil {
+				t.Fatalf("FastLZDecompress: %v", err)
+			}
+			if n != len(src) {
+				t.Errorf("decompressed size = %d, want %d", n, len(src))
+			}
+			for i := 0; i < n && i < len(src); i++ {
+				if dst[i] != src[i] {
+					t.Errorf("mismatch at byte %d: got %02x, want %02x", i, dst[i], src[i])
+					break
+				}
+			}
+
+			// Check compression ratio for compressible data
+			if tt.name == "highly_compressible" {
+				ratio := float64(len(compressed)) / float64(len(src))
+				t.Logf("compression ratio: %.2f%% (%d -> %d)", ratio*100, len(src), len(compressed))
+				if ratio > 0.5 {
+					t.Errorf("poor compression ratio for highly compressible data: %.2f%%", ratio*100)
+				}
+			}
+		})
+	}
+}
+
+func TestFastLZCompressRealGHO(t *testing.T) {
+	if _, err := os.Stat(testGHO); err != nil {
+		t.Skipf("test GHO not found: %s", testGHO)
+	}
+
+	// Read the real GHO, decompress partition, recompress with FastLZ, verify roundtrip
+	img, err := Open(testGHO)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer img.Close()
+
+	var origBuf bytes.Buffer
+	if err := img.DecompressPartition(0, &origBuf); err != nil {
+		t.Fatalf("DecompressPartition: %v", err)
+	}
+
+	origData := origBuf.Bytes()
+	t.Logf("Original decompressed: %d bytes (%.1f MB)", len(origData), float64(len(origData))/1024/1024)
+
+	// Compress each block and verify roundtrip
+	blockCount := 0
+	failCount := 0
+	totalOrig := 0
+	totalComp := 0
+
+	for off := 0; off < len(origData); off += BlockSize {
+		end := off + BlockSize
+		if end > len(origData) {
+			end = len(origData)
+		}
+		block := origData[off:end]
+
+		compressed := FastLZCompress(block)
+		if compressed == nil {
+			t.Fatalf("block %d: FastLZCompress returned nil", blockCount)
+		}
+
+		dst := make([]byte, BlockSize+1024)
+		n, err := FastLZDecompress(compressed, len(compressed), dst)
+		if err != nil {
+			t.Errorf("block %d: FastLZDecompress: %v", blockCount, err)
+			failCount++
+			blockCount++
+			continue
+		}
+		if n != len(block) {
+			t.Errorf("block %d: size mismatch: got %d, want %d", blockCount, n, len(block))
+			failCount++
+			blockCount++
+			continue
+		}
+		for i := 0; i < n; i++ {
+			if dst[i] != block[i] {
+				t.Errorf("block %d: data mismatch at byte %d", blockCount, i)
+				failCount++
+				break
+			}
+		}
+
+		totalOrig += len(block)
+		totalComp += len(compressed)
+		blockCount++
+	}
+
+	ratio := float64(totalComp) / float64(totalOrig) * 100
+	t.Logf("Blocks: %d total, %d failed, compression ratio: %.1f%%", blockCount, failCount, ratio)
+	if failCount > 0 {
+		t.Errorf("%d blocks failed roundtrip", failCount)
+	}
+}
+
 func TestZlibRoundtrip(t *testing.T) {
 	// Create test data with some repetition (compressible)
 	src := make([]byte, BlockSize)
@@ -201,36 +346,52 @@ func TestWriterRoundtrip(t *testing.T) {
 	copy(origTrack0, img.Track0)
 	img.Close()
 
-	// Create new GHO
-	tmpFile, err := os.CreateTemp("", "gho-roundtrip-*.gho")
-	if err != nil {
-		t.Fatal(err)
-	}
-	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
-
-	w, err := NewWriter(tmpFile, CompressionNone)
-	if err != nil {
-		t.Fatal(err)
-	}
-	w.WriteTrack0(origTrack0, 63)
-	w.WritePartition(bytes.NewReader(origBuf.Bytes()))
-	w.Close()
-
-	// Re-read and compare
-	img2, err := Open(tmpPath)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	defer img2.Close()
-
-	var rtBuf bytes.Buffer
-	if err := img2.DecompressPartition(0, &rtBuf); err != nil {
-		t.Fatalf("DecompressPartition roundtrip: %v", err)
+	compressions := []struct {
+		name string
+		comp byte
+	}{
+		{"none", CompressionNone},
+		{"fastlz", CompressionFast},
+		{"zlib6", CompressionHigh6},
 	}
 
-	if !bytes.Equal(origBuf.Bytes(), rtBuf.Bytes()) {
-		t.Errorf("roundtrip mismatch: orig=%d bytes, roundtrip=%d bytes",
-			origBuf.Len(), rtBuf.Len())
+	for _, tc := range compressions {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpFile, err := os.CreateTemp("", "gho-rt-*.gho")
+			if err != nil {
+				t.Fatal(err)
+			}
+			tmpPath := tmpFile.Name()
+			defer os.Remove(tmpPath)
+
+			w, err := NewWriter(tmpFile, tc.comp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			w.WriteTrack0(origTrack0, 63)
+			w.WritePartition(bytes.NewReader(origBuf.Bytes()))
+			w.Close()
+
+			// Check file size
+			fi, _ := os.Stat(tmpPath)
+			t.Logf("GHO file size: %d bytes (%.1f MB)", fi.Size(), float64(fi.Size())/1024/1024)
+
+			// Re-read and compare
+			img2, err := Open(tmpPath)
+			if err != nil {
+				t.Fatalf("reopen: %v", err)
+			}
+			defer img2.Close()
+
+			var rtBuf bytes.Buffer
+			if err := img2.DecompressPartition(0, &rtBuf); err != nil {
+				t.Fatalf("DecompressPartition roundtrip: %v", err)
+			}
+
+			if !bytes.Equal(origBuf.Bytes(), rtBuf.Bytes()) {
+				t.Errorf("roundtrip mismatch: orig=%d bytes, roundtrip=%d bytes",
+					origBuf.Len(), rtBuf.Len())
+			}
+		})
 	}
 }
